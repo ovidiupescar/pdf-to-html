@@ -35,3 +35,8 @@ async def health():
 _frontend = Path(__file__).resolve().parent.parent.parent / "frontend" / "out"
 if _frontend.exists():
     app.mount("/", StaticFiles(directory=str(_frontend), html=True), name="frontend")
+
+# ── Serve output files (figures, etc.) ─────────────────────────────────
+_output = Path(__file__).resolve().parent.parent / "output"
+_output.mkdir(parents=True, exist_ok=True)
+app.mount("/static-output", StaticFiles(directory=str(_output)), name="static-output")

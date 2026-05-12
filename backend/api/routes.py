@@ -138,10 +138,10 @@ def _transform_element(
         confidence = round(clip_confidence * 100)
 
         if "error" in mermaid_result:
-            rel = image_path.relative_to(upload_dir.parent.parent)
+            rel = image_path.relative_to(OUTPUT_DIR)
             return {
                 "type": "image",
-                "src": f"/output/{rel}",
+                "src": f"/static-output/{rel}",
             }
 
         return {
