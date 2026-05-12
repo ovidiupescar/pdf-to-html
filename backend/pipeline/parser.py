@@ -113,26 +113,56 @@ def _docling_get_image(item: Any, doc: Any) -> Any | None:
     return None
 
 
-def _get_bbox(item: Any) -> tuple | None:
+def _get_bbox(item: Any, doc: Any = None) -> tuple | None:
+    """Return bbox as (x0, y0, x1, y1) in TOP-LEFT pixel coordinates,
+    y0 < y1, ready for fitz.Rect.
+
+    Docling-core BoundingBox uses CoordOrigin.BOTTOMLEFT by default
+    (PDF native), so t > b in the input. We convert to TOPLEFT using
+    the page height when needed.
+    """
     item = _unpack(item)
-    # Prefer bbox from prov (page-anchored) — Docling 2.x puts it there.
+    bbox = None
+    page_no = None
+
     if hasattr(item, "prov") and item.prov:
         prov = item.prov[0]
         bbox = getattr(prov, "bbox", None)
-        if bbox is not None:
-            for attr in ("as_tuple", "l", "t", "r", "b"):
-                pass
-            if hasattr(bbox, "as_tuple"):
-                return bbox.as_tuple()
-            # docling-core BoundingBox has l, t, r, b
-            if all(hasattr(bbox, a) for a in ("l", "t", "r", "b")):
-                return (bbox.l, bbox.t, bbox.r, bbox.b)
-            return bbox
-    if hasattr(item, "bbox") and item.bbox:
-        if hasattr(item.bbox, "as_tuple"):
-            return item.bbox.as_tuple()
-        return item.bbox
-    return None
+        page_no = getattr(prov, "page_no", None) or getattr(prov, "page", None)
+    if bbox is None:
+        bbox = getattr(item, "bbox", None)
+
+    if bbox is None:
+        return None
+
+    # Extract numeric edges.
+    if hasattr(bbox, "l") and hasattr(bbox, "t") and hasattr(bbox, "r") and hasattr(bbox, "b"):
+        l, t, r, b = float(bbox.l), float(bbox.t), float(bbox.r), float(bbox.b)
+    elif hasattr(bbox, "as_tuple"):
+        l, t, r, b = (float(x) for x in bbox.as_tuple()[:4])
+    elif isinstance(bbox, (tuple, list)) and len(bbox) >= 4:
+        l, t, r, b = (float(x) for x in bbox[:4])
+    else:
+        return None
+
+    origin = getattr(bbox, "coord_origin", None)
+    origin_str = getattr(origin, "value", str(origin)) if origin is not None else "TOPLEFT"
+    is_bottom_left = origin_str.upper() == "BOTTOMLEFT"
+
+    if is_bottom_left and doc is not None and page_no is not None:
+        try:
+            page = doc.pages.get(int(page_no))
+            ph = float(page.size.height)
+            # BOTTOMLEFT: t > b. Convert: y_top = ph - t, y_bot = ph - b
+            y0, y1 = ph - t, ph - b
+        except Exception:
+            # Fallback when we cannot get page height: assume already TOPLEFT.
+            y0, y1 = min(t, b), max(t, b)
+    else:
+        y0, y1 = min(t, b), max(t, b)
+
+    x0, x1 = min(l, r), max(l, r)
+    return (x0, y0, x1, y1)
 
 
 def _get_page_number(item: Any) -> int:
@@ -151,10 +181,8 @@ def _pymupdf_crop(pdf_path: Path, page_no: int, bbox: tuple | None,
                    out_path: Path) -> bool:
     """Render a page region via PyMuPDF and save to PNG.
 
-    page_no is 1-based as Docling reports it. bbox is in Docling
-    coordinates (PDF points, origin bottom-left in some versions /
-    top-left in others). We try both and pick the larger non-degenerate
-    crop.
+    page_no is 1-based. bbox is in TOPLEFT pixel coords (x0, y0, x1, y1)
+    with y0 < y1 — _get_bbox normalizes Docling's BOTTOMLEFT input.
     """
     try:
         import fitz  # PyMuPDF
@@ -169,31 +197,21 @@ def _pymupdf_crop(pdf_path: Path, page_no: int, bbox: tuple | None,
                 return False
             page = doc[idx]
 
-            zoom = _IMAGES_SCALE
-            mat = fitz.Matrix(zoom, zoom)
+            mat = fitz.Matrix(_IMAGES_SCALE, _IMAGES_SCALE)
 
             if bbox is None:
                 pix = page.get_pixmap(matrix=mat)
             else:
-                l, t, r, b = (float(x) for x in bbox[:4])
-                ph = page.rect.height
-                # Try top-left origin first (Docling 2.x default)
-                rect_tl = fitz.Rect(l, t, r, b)
-                # Bottom-left origin fallback (older Docling, PDF native)
-                rect_bl = fitz.Rect(l, ph - b, r, ph - t)
-                candidates = [rect_tl, rect_bl]
-                # Pick the candidate that fits in page and has area
-                best = None
-                for rc in candidates:
-                    rc = rc & page.rect  # intersect with page
-                    if rc.is_empty or rc.width < 4 or rc.height < 4:
-                        continue
-                    if best is None or rc.get_area() > best.get_area():
-                        best = rc
-                if best is None:
+                x0, y0, x1, y1 = (float(v) for v in bbox[:4])
+                rect = fitz.Rect(x0, y0, x1, y1) & page.rect
+                if rect.is_empty or rect.width < 4 or rect.height < 4:
+                    logger.warning(
+                        "PyMuPDF crop degenerate for page %d bbox %s "
+                        "(intersect=%s) — rendering full page instead",
+                        page_no, bbox, rect)
                     pix = page.get_pixmap(matrix=mat)
                 else:
-                    pix = page.get_pixmap(matrix=mat, clip=best)
+                    pix = page.get_pixmap(matrix=mat, clip=rect)
 
             out_path.parent.mkdir(parents=True, exist_ok=True)
             pix.save(str(out_path))
@@ -423,35 +441,39 @@ def parse_pdf(path: str | Path) -> list[dict[str, Any]]:
                 "  item label=%s picture=%s page=%s bbox=%s text=%r",
                 label, is_pic,
                 _get_page_number(item),
-                _get_bbox(item),
+                _get_bbox(item, doc),
                 (_get_text(item) or "")[:60],
             )
 
         # ── Figure / Picture items ────────────────────────────────────
         if is_pic:
             page_no = _get_page_number(item)
-            bbox = _get_bbox(item)
+            bbox = _get_bbox(item, doc)
             fig_path = fig_dir / f"figure_{figure_idx}.png"
 
-            # Try Docling's native image first.
-            img = _docling_get_image(item, doc)
+            # IMPORTANT: do NOT trust Docling's get_image() content.
+            # On at least docling 2.93 / docling-core 2.75, a PictureItem
+            # whose bbox covers a large diagram region returns the wrong
+            # crop (often a footer logo). The bbox itself is reliable —
+            # the image content is not. Render the bbox ourselves.
             saved = False
-            if img is not None:
-                try:
-                    fig_dir.mkdir(parents=True, exist_ok=True)
-                    img.save(str(fig_path))
-                    saved = True
-                    logger.info("Figure %d: Docling image saved (page %d)",
-                                figure_idx, page_no)
-                except Exception as exc:
-                    logger.warning("Docling image save failed: %s", exc)
-
-            # Fallback: render the page region via PyMuPDF using bbox.
-            if not saved:
-                if _pymupdf_crop(path, page_no, bbox, fig_path):
-                    saved = True
-                    logger.info("Figure %d: PyMuPDF crop saved (page %d bbox=%s)",
-                                figure_idx, page_no, bbox)
+            if bbox is not None and _pymupdf_crop(path, page_no, bbox, fig_path):
+                saved = True
+                logger.info("Figure %d: PyMuPDF bbox crop saved (page %d bbox=%s)",
+                            figure_idx, page_no, bbox)
+            else:
+                # Last resort: trust Docling's image (better than nothing,
+                # and a few item types may still get it right).
+                img = _docling_get_image(item, doc)
+                if img is not None:
+                    try:
+                        fig_dir.mkdir(parents=True, exist_ok=True)
+                        img.save(str(fig_path))
+                        saved = True
+                        logger.info("Figure %d: Docling image fallback (page %d)",
+                                    figure_idx, page_no)
+                    except Exception as exc:
+                        logger.warning("Docling image save failed: %s", exc)
 
             if saved:
                 elements.append(
@@ -477,7 +499,7 @@ def parse_pdf(path: str | Path) -> list[dict[str, Any]]:
                 {
                     "type": label or "text",
                     "text": text,
-                    "bbox": _get_bbox(item),
+                    "bbox": _get_bbox(item, doc),
                     "page_number": _get_page_number(item),
                 }
             )
@@ -491,7 +513,7 @@ def parse_pdf(path: str | Path) -> list[dict[str, Any]]:
                     "type": "table",
                     "dataframe": df.to_dict(orient="records"),
                     "columns": list(df.columns),
-                    "bbox": _get_bbox(item),
+                    "bbox": _get_bbox(item, doc),
                     "page_number": _get_page_number(item),
                 }
             )
