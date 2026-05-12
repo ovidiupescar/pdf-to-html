@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ title }} — PDF to HTML</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/bpmn-js@13/dist/bpmn-viewer.production.min.js"></script>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --text: #1a1a1a;
+      --text-muted: #666;
+      --border: #ddd;
+      --accent: #2563eb;
+      --font: 'Georgia', 'Times New Roman', serif;
+    }
+    body { font-family: var(--font); max-width: 900px; margin: 0 auto; padding: 2rem; color: var(--text); line-height: 1.7; }
+    h1, h2, h3, h4 { font-weight: 700; line-height: 1.3; margin-top: 1.5em; margin-bottom: 0.5em; }
+    h1 { font-size: 2em; border-bottom: 2px solid var(--accent); padding-bottom: 0.3em; }
+    h2 { font-size: 1.5em; }
+    h3 { font-size: 1.25em; }
+    p { margin: 0.75em 0; }
+    table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: 0.9em; }
+    th, td { border: 1px solid var(--border); padding: 0.5em 0.75em; text-align: left; }
+    th { background: #f5f5f5; font-weight: 600; }
+    img { max-width: 100%; height: auto; margin: 1em 0; }
+    .mermaid { text-align: center; margin: 1.5em 0; }
+    .feedback { display: flex; gap: 0.5rem; align-items: center; margin-top: 0.5rem; font-size: 0.8rem; color: var(--text-muted); }
+    .feedback button { background: none; border: 1px solid var(--border); border-radius: 4px; padding: 0.25rem 0.5rem; cursor: pointer; }
+    .feedback button:hover { background: #f0f0f0; }
+    .confidence-badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; font-size: 0.7rem; font-weight: 600; }
+    .conf-high { background: #dcfce7; color: #166534; }
+    .conf-medium { background: #fef9c3; color: #854d0e; }
+    .conf-low { background: #fee2e2; color: #991b1b; }
+    .diagram-container { border: 1px solid var(--border); border-radius: 8px; padding: 1rem; margin: 1.5em 0; }
+    .diagram-container .footer { font-size: 0.8rem; color: var(--text-muted); margin-top: 0.75rem; padding-top: 0.5rem; border-top: 1px solid var(--border); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>{{ title }}</h1>
+    <p style="color: var(--text-muted); font-size: 0.9rem;">
+      Generated from <strong>{{ source_filename }}</strong> &middot; {{ page_count }} pages &middot; {{ diagram_count }} diagrams
+    </p>
+  </header>
+
+  <main>
+    {% for element in elements %}
+      {% if element.type == "text" %}
+        {% if element.style == "heading" %}
+          <h{{ element.level|default(2) }}>{{ element.text }}</h{{ element.level|default(2) }}>
+        {% else %}
+          <p>{{ element.text }}</p>
+        {% endif %}
+
+      {% elif element.type == "table" %}
+        <table>
+          {% if element.columns %}
+          <thead>
+            <tr>
+              {% for col in element.columns %}
+              <th>{{ col }}</th>
+              {% endfor %}
+            </tr>
+          </thead>
+          {% endif %}
+          <tbody>
+            {% for row in element.rows %}
+            <tr>
+              {% for cell in row %}
+              <td>{{ cell }}</td>
+              {% endfor %}
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+
+      {% elif element.type == "diagram" %}
+        <div class="diagram-container">
+          <div class="mermaid">
+            {{ element.mermaid_code }}
+          </div>
+          <div class="footer">
+            <span class="confidence-badge
+              {% if element.confidence >= 70 %}conf-high
+              {% elif element.confidence >= 40 %}conf-medium
+              {% else %}conf-low{% endif %}">
+              {{ element.confidence }}% confidence
+            </span>
+            &middot; {{ element.diagram_type }}
+            {% if element.model_used %}
+            &middot; via {{ element.model_used }}
+            {% endif %}
+            <div class="feedback">
+              <span>Was this correct?</span>
+              <button onclick="feedback('{{ element.id }}', true)">👍 Yes</button>
+              <button onclick="feedback('{{ element.id }}', false)">👎 No</button>
+            </div>
+          </div>
+        </div>
+
+      {% elif element.type == "image" %}
+        <figure>
+          <img src="{{ element.src }}" alt="{{ element.caption|default('') }}">
+          {% if element.caption %}
+          <figcaption style="font-size: 0.85rem; color: var(--text-muted); text-align: center;">
+            {{ element.caption }}
+          </figcaption>
+          {% endif %}
+        </figure>
+
+      {% elif element.type == "equation" %}
+        <div style="text-align: center; margin: 1em 0;">
+          \[ {{ element.latex }} \]
+        </div>
+
+      {% elif element.type == "bpmn" %}
+        <div id="bpmn-{{ element.id }}" style="height: 400px; margin: 1em 0;"></div>
+        <script>
+          (async function() {
+            try {
+              var viewer = new BpmnJS({ container: '#bpmn-{{ element.id }}' });
+              var xml = `{{ element.bpmn_xml | e('js') }}`;
+              await viewer.importXML(xml);
+            } catch(e) { console.error('BPMN render error:', e); }
+          })();
+        </script>
+      {% endif %}
+    {% endfor %}
+  </main>
+
+  <footer style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); font-size: 0.8rem; color: var(--text-muted);">
+    Generated by PDF Tech → HTML &middot; <a href="{{ source_url | default('#') }}">Download original PDF</a>
+  </footer>
+
+  <script>
+    mermaid.initialize({ startOnLoad: true, theme: 'default', securityLevel: 'strict' });
+
+    function feedback(diagramId, isPositive) {
+      fetch('/api/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ diagram_id: diagramId, correct: isPositive })
+      }).then(r => r.json()).then(d => {
+        console.log('Feedback saved:', d);
+      }).catch(e => console.error('Feedback error:', e));
+    }
+  </script>
+</body>
+</html>
