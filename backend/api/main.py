@@ -1,7 +1,10 @@
 """PDF Tech → HTML — FastAPI application."""
 
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from backend.api.routes import router
 
@@ -25,3 +28,10 @@ app.include_router(router, prefix="/api")
 @app.get("/health")
 async def health():
     return {"status": "ok", "version": "0.2.0"}
+
+
+# ── Serve built frontend as static files ──────────────────────────────
+# Must be mounted last so API routes take priority.
+_frontend = Path(__file__).resolve().parent.parent.parent / "frontend" / "out"
+if _frontend.exists():
+    app.mount("/", StaticFiles(directory=str(_frontend), html=True), name="frontend")
