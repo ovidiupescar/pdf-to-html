@@ -1,0 +1,43 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: pdf2html-backend
+    env_file:
+      - backend/.env
+    environment:
+      - PORT=8000
+    expose:
+      - 8000
+    volumes:
+      - pdf2html_output:/app/backend/output
+    restart: unless-stopped
+    networks:
+      - pdf2html-net
+
+  frontend:
+    build:
+      context: frontend
+      dockerfile: Dockerfile
+    container_name: pdf2html-frontend
+    environment:
+      - API_HOST=backend
+      - API_PORT=8000
+      - PORT=3000
+    expose:
+      - 3000
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - pdf2html-net
+
+volumes:
+  pdf2html_output:
+
+networks:
+  pdf2html-net:
+    driver: bridge

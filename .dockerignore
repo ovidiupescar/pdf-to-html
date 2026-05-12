@@ -1,0 +1,12 @@
+frontend/
+node_modules/
+.git/
+.gitignore
+README.md
+docker-compose.yml
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv
+output/
