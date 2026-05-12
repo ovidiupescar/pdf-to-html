@@ -78,8 +78,35 @@ def _get_dataframe(item: Any) -> Any | None:
     return None
 
 
+def _is_picture(item: Any) -> bool:
+    """True only for actual figure/picture items.
+
+    Critical: Docling 2.x defines `get_image(doc)` on the DocItem base,
+    so it returns a page-crop PIL for ANY item (text, table, picture).
+    We must gate image extraction on the item being a real PictureItem,
+    otherwise every text block becomes a figure and the body collapses.
+    """
+    item = _unpack(item)
+
+    # Prefer isinstance check when the type is importable.
+    try:
+        from docling_core.types.doc import PictureItem  # type: ignore
+        if isinstance(item, PictureItem):
+            return True
+    except Exception:
+        pass
+
+    # Fallback: label-based detection (Docling 2.x uses lowercase enum values).
+    label = _get_label(item).lower()
+    return label in {"picture", "figure"}
+
+
 def _get_image(item: Any, doc: Any) -> Any | None:
     """Extract a PIL Image from a Docling PictureItem.
+
+    Caller must have already verified `_is_picture(item)` — this function
+    does NOT re-check, so calling it on a text item will yield a page
+    crop and silently turn text into a figure.
 
     With `generate_picture_images=True`, Docling 2.x stores images as
     ImageRef objects (not raw PIL). `PictureItem.get_image(doc)` is the
@@ -149,27 +176,35 @@ def parse_pdf(path: str | Path) -> list[dict[str, Any]]:
         label = _get_label(item)
 
         # ── Figure / Picture items ────────────────────────────────────
-        # Check images BEFORE text, because some PictureItems also carry
-        # caption text — we want the figure, not the caption swallowing it.
-        img = _get_image(item, doc)
-        if img is not None:
-            fig_dir = Path(path).parent / "figures"
-            fig_dir.mkdir(parents=True, exist_ok=True)
-            fig_path = fig_dir / f"figure_{figure_idx}.png"
-            try:
-                img.save(str(fig_path))
-                elements.append(
-                    {
-                        "type": "figure",
-                        "image_path": str(fig_path),
-                        "bbox": _get_bbox(item),
-                        "page_number": _get_page_number(item),
-                    }
+        # Gate on _is_picture: get_image(doc) returns a page-crop for
+        # ANY item type in Docling 2.x, so without this check every text
+        # block becomes a figure.
+        if _is_picture(item):
+            img = _get_image(item, doc)
+            if img is not None:
+                fig_dir = Path(path).parent / "figures"
+                fig_dir.mkdir(parents=True, exist_ok=True)
+                fig_path = fig_dir / f"figure_{figure_idx}.png"
+                try:
+                    img.save(str(fig_path))
+                    elements.append(
+                        {
+                            "type": "figure",
+                            "image_path": str(fig_path),
+                            "bbox": _get_bbox(item),
+                            "page_number": _get_page_number(item),
+                        }
+                    )
+                    figure_idx += 1
+                    continue
+                except Exception as exc:
+                    logger.warning("Failed to save figure %d: %s", figure_idx, exc)
+            else:
+                logger.warning(
+                    "PictureItem on page %d has no extractable image — "
+                    "generate_picture_images may not be effective",
+                    _get_page_number(item),
                 )
-                figure_idx += 1
-                continue
-            except Exception as exc:
-                logger.warning("Failed to save figure %d: %s", figure_idx, exc)
 
         # ── Text items ──
         text = _get_text(item)
