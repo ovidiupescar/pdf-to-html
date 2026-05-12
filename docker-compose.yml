@@ -1,0 +1,17 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pdf2html
+    ports:
+      - "3581:3581"
+    environment:
+      - PORT=3581
+      - OUTPUT_DIR=/app/output
+    volumes:
+      - pdf2html_output:/app/output
+    restart: unless-stopped
+
+volumes:
+  pdf2html_output:
