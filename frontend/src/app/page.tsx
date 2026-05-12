@@ -74,7 +74,7 @@ export default function Home() {
     const form = new FormData();
     form.append("file", file);
     try {
-      const res = await fetch("/api/upload", { method: "POST", body: form });
+      const res = await fetch("/api/convert", { method: "POST", body: form });
       if (!res.ok) throw new Error("Upload failed");
       const data = await res.json();
       setJobId(data.job_id);
