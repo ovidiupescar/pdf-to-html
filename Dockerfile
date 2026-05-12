@@ -13,9 +13,15 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System dependencies (for docling / torch)
+# System dependencies (for docling / torch / OpenCV)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libxcb1 \
+    libxcb-shm0 \
+    libx11-6 \
+    libxext6 \
     && rm -rf /var/lib/apt/lists/*
 
 # Python dependencies
