@@ -34,41 +34,43 @@ _HEADING_PATTERNS = re.compile(
 )
 
 
+def _update_job(job_id: str, **updates) -> None:
+    """Thread-safe update of a job's fields. Skips None values so
+    callers can pass optional fields without accidentally clearing them."""
+    current = _jobs[job_id]
+    filtered = {k: v for k, v in updates.items() if v is not None}
+    _jobs[job_id] = current.model_copy(update=filtered)
+
+
 def _process_pdf_background(
     job_id: str,
     file_path: Path,
     upload_dir: Path,
     original_filename: str,
 ) -> None:
-    job = _jobs[job_id]
     try:
-        _jobs[job_id] = job.model_copy(
-            update={"status": JobStatus.processing, "progress": 5}
-        )
+        _update_job(job_id, status=JobStatus.processing, progress=5, message="Validating PDF...")
 
         validation = validate_pdf(file_path)
         if not validation.valid:
-            _jobs[job_id] = job.model_copy(
-                update={
-                    "status": JobStatus.failed,
-                    "error": validation.error,
-                    "progress": 0,
-                }
-            )
+            _update_job(job_id, status=JobStatus.failed, error=validation.error, progress=0, message="Validation failed")
             return
 
         page_count = validation.page_count
-        _jobs[job_id] = _jobs[job_id].model_copy(
-            update={"page_count": page_count, "progress": 15}
-        )
+        _update_job(job_id, page_count=page_count, progress=15, message=f"PDF valid — {page_count} pages. Parsing with Docling...")
 
         raw_elements = parse_pdf(file_path)
+        _update_job(job_id, progress=30, message=f"Docling parsed {len(raw_elements)} elements. Classifying diagrams...")
 
         transformed: list[dict] = []
-        for elem in raw_elements:
+        diagram_count = 0
+        for i, elem in enumerate(raw_elements):
+            if "image_path" in elem:
+                diagram_count += 1
+                _update_job(job_id, progress=30 + min(diagram_count * 5, 40), message=f"Converting diagram {diagram_count} — classifying with CLIP...")
             transformed.append(_transform_element(elem, upload_dir, job_id))
 
-        _jobs[job_id] = _jobs[job_id].model_copy(update={"progress": 80})
+        _update_job(job_id, progress=80, message=f"Assembling HTML with {len(transformed)} elements...")
 
         output_html_path = upload_dir / "output.html"
         assemble_html(
@@ -79,28 +81,22 @@ def _process_pdf_background(
             output_path=output_html_path,
         )
 
-        _jobs[job_id] = _jobs[job_id].model_copy(
-            update={
-                "status": JobStatus.completed,
-                "progress": 100,
-                "download_url": f"/api/download/{job_id}",
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-                "diagram_count": sum(
-                    1 for e in transformed if e.get("type") in ("diagram", "image")
-                ),
-            }
+        _update_job(
+            job_id,
+            status=JobStatus.completed,
+            progress=100,
+            message="Conversion complete!",
+            download_url=f"/api/download/{job_id}",
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            diagram_count=sum(
+                1 for e in transformed if e.get("type") in ("diagram", "image")
+            ),
         )
         logger.info("Job %s completed successfully", job_id)
 
     except Exception as exc:
         logger.exception("Job %s failed", job_id)
-        _jobs[job_id] = _jobs[job_id].model_copy(
-            update={
-                "status": JobStatus.failed,
-                "error": str(exc),
-                "progress": 0,
-            }
-        )
+        _update_job(job_id, status=JobStatus.failed, error=str(exc), progress=0, message=f"Error: {exc}")
 
 
 def _transform_element(

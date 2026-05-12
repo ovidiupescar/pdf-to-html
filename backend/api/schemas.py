@@ -38,6 +38,7 @@ class JobInfo(BaseModel):
     error: Optional[str] = None
     download_url: Optional[str] = None
     progress: int = Field(default=0, ge=0, le=100)
+    message: str = Field(default="")
 
 
 class ErrorResponse(BaseModel):
