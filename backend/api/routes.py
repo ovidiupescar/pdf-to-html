@@ -60,7 +60,14 @@ def _process_pdf_background(
         _update_job(job_id, page_count=page_count, progress=15, message=f"PDF valid — {page_count} pages. Parsing with Docling...")
 
         raw_elements = parse_pdf(file_path)
-        _update_job(job_id, progress=30, message=f"Docling parsed {len(raw_elements)} elements. Classifying diagrams...")
+        raw_figure_count = sum(1 for e in raw_elements if "image_path" in e)
+        logger.info("parse_pdf returned %d elements (%d with image_path)",
+                    len(raw_elements), raw_figure_count)
+        _update_job(
+            job_id, progress=30,
+            message=f"Docling parsed {len(raw_elements)} elements "
+                    f"({raw_figure_count} figures). Classifying diagrams..."
+        )
 
         transformed: list[dict] = []
         diagram_count = 0
@@ -132,24 +139,37 @@ def _transform_element(
 
     if "image_path" in elem:
         image_path = Path(elem["image_path"])
-        diagram_type, clip_confidence = classify_diagram(image_path)
-        mermaid_result = convert_diagram_to_mermaid(image_path)
-        # CLIP returns 0-1 probability; template expects 0-100
-        confidence = round(clip_confidence * 100)
+        logger.info("Transforming figure: %s (page %s)",
+                    image_path.name, elem.get("page_number"))
 
-        if "error" in mermaid_result:
-            rel = image_path.relative_to(OUTPUT_DIR)
+        diagram_type, clip_confidence = classify_diagram(image_path)
+        confidence = round(clip_confidence * 100)
+        logger.info("  CLIP: %s (%.0f%%)", diagram_type, confidence)
+
+        mermaid_result = convert_diagram_to_mermaid(image_path)
+        mermaid_code = (mermaid_result.get("mermaid_code") or "").strip()
+        mermaid_err = mermaid_result.get("error")
+
+        # Fall back to <img> whenever Mermaid is unusable: explicit error,
+        # missing code, or trivially short output (a few characters that
+        # would render as garbage).
+        if mermaid_err or len(mermaid_code) < 10:
+            reason = mermaid_err or f"mermaid_code too short ({len(mermaid_code)} chars)"
+            logger.warning("  Mermaid unusable (%s) — falling back to <img>", reason)
+            rel = image_path.relative_to(OUTPUT_DIR).as_posix()
             return {
                 "type": "image",
                 "src": f"/static-output/{rel}",
             }
 
+        logger.info("  Mermaid: %d chars, %d lines",
+                    len(mermaid_code), mermaid_code.count("\n") + 1)
         return {
             "type": "diagram",
             "id": str(uuid.uuid4()),
             "diagram_type": diagram_type,
             "confidence": confidence,
-            "mermaid_code": mermaid_result["mermaid_code"],
+            "mermaid_code": mermaid_code,
             "model_used": "gpt-4o",
         }
 

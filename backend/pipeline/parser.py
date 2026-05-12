@@ -1,11 +1,20 @@
 """Docling-based PDF parser — extracts text blocks, tables, and figures.
 
 Compatible with Docling 2.x (iterate_items yields (item, level) tuples).
+
+Figure extraction is best-effort with multiple fallbacks:
+  1. Docling PictureItem.get_image(doc) — canonical path
+  2. PictureItem bbox + PyMuPDF render — works when Docling generated
+     no PIL but at least classified the region as a picture
+  3. PyMuPDF whole-page image scan — finds embedded raster images that
+     Docling's layout model may have missed entirely
 """
 
 from __future__ import annotations
 
 import logging
+import os
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -18,16 +27,12 @@ logger = logging.getLogger(__name__)
 # 2.0 ~= 144 DPI — high enough for GPT-4o vision to read diagram text.
 _IMAGES_SCALE = 2.0
 
+# Verbose dump of every iterate_items() element. Toggle via env to keep
+# normal logs readable but flip on when figures go missing.
+_DEBUG_DUMP = os.getenv("PDF2HTML_DEBUG_PARSER", "0") == "1"
+
 
 def _build_converter() -> DocumentConverter:
-    """Build a converter that emits cropped picture images.
-
-    Docling's default pipeline does NOT generate picture image data:
-    PictureItems are detected but their image refs stay empty, so
-    `item.image` / `get_image(doc)` return None and figures are silently
-    dropped. We must enable `generate_picture_images` and keep page
-    bitmaps at sufficient resolution via `images_scale`.
-    """
     pipeline_options = PdfPipelineOptions()
     pipeline_options.images_scale = _IMAGES_SCALE
     pipeline_options.generate_picture_images = True
@@ -41,12 +46,10 @@ def _build_converter() -> DocumentConverter:
 
 
 def _unpack(item: Any) -> Any:
-    """Unpack (item, level) tuple if needed."""
     return item[0] if isinstance(item, tuple) else item
 
 
 def _get_label(item: Any) -> str:
-    """Extract the label/type from a Docling item."""
     item = _unpack(item)
     if hasattr(item, "label"):
         label = item.label
@@ -57,7 +60,6 @@ def _get_label(item: Any) -> str:
 
 
 def _get_text(item: Any) -> str | None:
-    """Extract text from a Docling item."""
     item = _unpack(item)
     if hasattr(item, "text") and item.text:
         return str(item.text)
@@ -65,13 +67,10 @@ def _get_text(item: Any) -> str | None:
 
 
 def _get_dataframe(item: Any) -> Any | None:
-    """Extract pandas DataFrame from a Docling TableItem."""
     item = _unpack(item)
-    # Docling 2.x: TableItem.data (TableData) with export_to_dataframe()
     if hasattr(item, "data") and item.data is not None:
         if hasattr(item.data, "export_to_dataframe"):
             return item.data.export_to_dataframe()
-        # Fallback: might be a raw DataFrame
         import pandas as pd
         if isinstance(item.data, pd.DataFrame):
             return item.data
@@ -79,39 +78,19 @@ def _get_dataframe(item: Any) -> Any | None:
 
 
 def _is_picture(item: Any) -> bool:
-    """True only for actual figure/picture items.
-
-    Critical: Docling 2.x defines `get_image(doc)` on the DocItem base,
-    so it returns a page-crop PIL for ANY item (text, table, picture).
-    We must gate image extraction on the item being a real PictureItem,
-    otherwise every text block becomes a figure and the body collapses.
-    """
     item = _unpack(item)
-
-    # Prefer isinstance check when the type is importable.
     try:
         from docling_core.types.doc import PictureItem  # type: ignore
         if isinstance(item, PictureItem):
             return True
     except Exception:
         pass
-
-    # Fallback: label-based detection (Docling 2.x uses lowercase enum values).
     label = _get_label(item).lower()
-    return label in {"picture", "figure"}
+    return label in {"picture", "figure", "chart", "image"}
 
 
-def _get_image(item: Any, doc: Any) -> Any | None:
-    """Extract a PIL Image from a Docling PictureItem.
-
-    Caller must have already verified `_is_picture(item)` — this function
-    does NOT re-check, so calling it on a text item will yield a page
-    crop and silently turn text into a figure.
-
-    With `generate_picture_images=True`, Docling 2.x stores images as
-    ImageRef objects (not raw PIL). `PictureItem.get_image(doc)` is the
-    canonical accessor; older fallbacks kept for safety across versions.
-    """
+def _docling_get_image(item: Any, doc: Any) -> Any | None:
+    """Try Docling's own image accessors. Returns PIL or None."""
     item = _unpack(item)
 
     get_image = getattr(item, "get_image", None)
@@ -128,15 +107,27 @@ def _get_image(item: Any, doc: Any) -> Any | None:
         pil = getattr(img_attr, "pil_image", None)
         if pil is not None:
             return pil
-        if hasattr(img_attr, "save"):  # raw PIL on older versions
+        if hasattr(img_attr, "save"):
             return img_attr
 
     return None
 
 
 def _get_bbox(item: Any) -> tuple | None:
-    """Extract bounding box from a Docling item."""
     item = _unpack(item)
+    # Prefer bbox from prov (page-anchored) — Docling 2.x puts it there.
+    if hasattr(item, "prov") and item.prov:
+        prov = item.prov[0]
+        bbox = getattr(prov, "bbox", None)
+        if bbox is not None:
+            for attr in ("as_tuple", "l", "t", "r", "b"):
+                pass
+            if hasattr(bbox, "as_tuple"):
+                return bbox.as_tuple()
+            # docling-core BoundingBox has l, t, r, b
+            if all(hasattr(bbox, a) for a in ("l", "t", "r", "b")):
+                return (bbox.l, bbox.t, bbox.r, bbox.b)
+            return bbox
     if hasattr(item, "bbox") and item.bbox:
         if hasattr(item.bbox, "as_tuple"):
             return item.bbox.as_tuple()
@@ -145,65 +136,338 @@ def _get_bbox(item: Any) -> tuple | None:
 
 
 def _get_page_number(item: Any) -> int:
-    """Extract page number from a Docling item."""
     item = _unpack(item)
     if hasattr(item, "prov") and item.prov:
         prov = item.prov[0]
-        if hasattr(prov, "page"):
-            return prov.page
+        page = getattr(prov, "page_no", None)
+        if page is None:
+            page = getattr(prov, "page", None)
+        if page is not None:
+            return int(page)
     return 0
 
 
-def parse_pdf(path: str | Path) -> list[dict[str, Any]]:
-    """Parse a PDF into structured elements using Docling.
+def _pymupdf_crop(pdf_path: Path, page_no: int, bbox: tuple | None,
+                   out_path: Path) -> bool:
+    """Render a page region via PyMuPDF and save to PNG.
 
-    Returns:
-        List of element dicts, each with:
-        - type: "text" | "table" | "figure"
-        - text / dataframe / image_path (depending on type)
-        - bbox: bounding box [x1, y1, x2, y2]
-        - page_number: int
+    page_no is 1-based as Docling reports it. bbox is in Docling
+    coordinates (PDF points, origin bottom-left in some versions /
+    top-left in others). We try both and pick the larger non-degenerate
+    crop.
     """
+    try:
+        import fitz  # PyMuPDF
+    except Exception as exc:
+        logger.warning("PyMuPDF unavailable: %s", exc)
+        return False
+
+    try:
+        with fitz.open(str(pdf_path)) as doc:
+            idx = max(0, int(page_no) - 1)
+            if idx >= doc.page_count:
+                return False
+            page = doc[idx]
+
+            zoom = _IMAGES_SCALE
+            mat = fitz.Matrix(zoom, zoom)
+
+            if bbox is None:
+                pix = page.get_pixmap(matrix=mat)
+            else:
+                l, t, r, b = (float(x) for x in bbox[:4])
+                ph = page.rect.height
+                # Try top-left origin first (Docling 2.x default)
+                rect_tl = fitz.Rect(l, t, r, b)
+                # Bottom-left origin fallback (older Docling, PDF native)
+                rect_bl = fitz.Rect(l, ph - b, r, ph - t)
+                candidates = [rect_tl, rect_bl]
+                # Pick the candidate that fits in page and has area
+                best = None
+                for rc in candidates:
+                    rc = rc & page.rect  # intersect with page
+                    if rc.is_empty or rc.width < 4 or rc.height < 4:
+                        continue
+                    if best is None or rc.get_area() > best.get_area():
+                        best = rc
+                if best is None:
+                    pix = page.get_pixmap(matrix=mat)
+                else:
+                    pix = page.get_pixmap(matrix=mat, clip=best)
+
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            pix.save(str(out_path))
+            return True
+    except Exception as exc:
+        logger.warning("PyMuPDF crop failed for page %d bbox %s: %s",
+                       page_no, bbox, exc)
+        return False
+
+
+def _bbox_iou(a: tuple, b: tuple) -> float:
+    """Intersection-over-union for two (x0,y0,x1,y1) tuples."""
+    ax0, ay0, ax1, ay1 = (float(x) for x in a[:4])
+    bx0, by0, bx1, by1 = (float(x) for x in b[:4])
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    inter = (ix1 - ix0) * (iy1 - iy0)
+    a_area = max(0.0, (ax1 - ax0)) * max(0.0, (ay1 - ay0))
+    b_area = max(0.0, (bx1 - bx0)) * max(0.0, (by1 - by0))
+    union = a_area + b_area - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _overlaps_existing(extra: dict, existing: list[tuple[int, tuple]],
+                        iou_threshold: float = 0.3) -> bool:
+    """True if `extra` figure overlaps any (page, bbox) in `existing`."""
+    bbox = extra.get("bbox")
+    page = extra.get("page_number")
+    if bbox is None:
+        return False
+    for ep, eb in existing:
+        if ep != page or eb is None:
+            continue
+        if _bbox_iou(bbox, eb) >= iou_threshold:
+            return True
+    return False
+
+
+def _cluster_rects(rects: list, gap: float = 20.0) -> list:
+    """Greedy spatial clustering: group rects whose bboxes touch or are
+    closer than `gap` (PDF points). Returns merged Rects.
+
+    Used to turn a soup of vector path bboxes into diagram-shaped regions.
+    """
+    import fitz
+    remaining = [r for r in rects if r.width > 0 and r.height > 0]
+    clusters: list = []
+    while remaining:
+        seed = remaining.pop(0)
+        cluster = fitz.Rect(seed)
+        grew = True
+        while grew:
+            grew = False
+            still: list = []
+            for r in remaining:
+                expanded = fitz.Rect(cluster) + (-gap, -gap, gap, gap)
+                if r.intersects(expanded):
+                    cluster |= r
+                    grew = True
+                else:
+                    still.append(r)
+            remaining = still
+        clusters.append(cluster)
+    return clusters
+
+
+def _pymupdf_page_image_fallback(pdf_path: Path, fig_dir: Path,
+                                   starting_idx: int) -> list[dict[str, Any]]:
+    """Last-resort scan for figures when Docling finds nothing.
+
+    Two passes:
+      1. Embedded raster images (page.get_images) — catches JPEGs/PNGs
+         placed in the PDF.
+      2. Vector drawings (page.get_drawings) — clustered into diagram-
+         sized regions. Catches the technical-diagram case where the
+         "figure" is just paths, rectangles, and text and Docling's
+         layout model missed it.
+    """
+    try:
+        import fitz
+    except Exception:
+        return []
+
+    found: list[dict[str, Any]] = []
+    idx = starting_idx
+    try:
+        with fitz.open(str(pdf_path)) as doc:
+            for pno in range(doc.page_count):
+                page = doc[pno]
+
+                # Pass 1: embedded raster images
+                for img_info in page.get_images(full=True):
+                    xref = img_info[0]
+                    try:
+                        rects = page.get_image_rects(xref)
+                    except Exception:
+                        rects = []
+                    if not rects:
+                        continue
+                    rect = rects[0]
+                    if rect.width < 50 or rect.height < 50:
+                        continue
+                    fig_dir.mkdir(parents=True, exist_ok=True)
+                    fig_path = fig_dir / f"figure_{idx}.png"
+                    mat = fitz.Matrix(_IMAGES_SCALE, _IMAGES_SCALE)
+                    try:
+                        pix = page.get_pixmap(matrix=mat, clip=rect)
+                        pix.save(str(fig_path))
+                        found.append({
+                            "type": "figure",
+                            "image_path": str(fig_path),
+                            "bbox": (rect.x0, rect.y0, rect.x1, rect.y1),
+                            "page_number": pno + 1,
+                            "source": "pymupdf_raster",
+                        })
+                        idx += 1
+                        logger.info("PyMuPDF raster image on page %d", pno + 1)
+                    except Exception as exc:
+                        logger.debug("page.get_pixmap failed: %s", exc)
+
+                # Pass 2: vector drawing clusters
+                try:
+                    drawings = page.get_drawings()
+                except Exception as exc:
+                    logger.debug("get_drawings failed on page %d: %s", pno + 1, exc)
+                    drawings = []
+
+                if not drawings:
+                    continue
+
+                draw_rects = []
+                for d in drawings:
+                    r = d.get("rect")
+                    if r is None or r.is_empty:
+                        continue
+                    # Skip single thin lines and tiny shapes — likely
+                    # rules or table borders, not diagrams.
+                    if r.width < 5 and r.height < 5:
+                        continue
+                    draw_rects.append(fitz.Rect(r))
+
+                if not draw_rects:
+                    continue
+
+                # Cluster nearby drawings; treat each cluster as one figure.
+                clusters = _cluster_rects(draw_rects, gap=15.0)
+
+                page_area = page.rect.get_area() or 1.0
+                for cl in clusters:
+                    cl = cl & page.rect
+                    if cl.is_empty:
+                        continue
+                    area = cl.get_area()
+                    # Require a substantial region — at least 3% of page,
+                    # and at least 80x80 pt. Filters out single horizontal
+                    # rules and inline glyphs.
+                    if area / page_area < 0.03 or cl.width < 80 or cl.height < 80:
+                        continue
+                    # Also require it isn't basically the whole page (which
+                    # would just be re-rendering the page).
+                    if area / page_area > 0.85:
+                        continue
+
+                    fig_dir.mkdir(parents=True, exist_ok=True)
+                    fig_path = fig_dir / f"figure_{idx}.png"
+                    mat = fitz.Matrix(_IMAGES_SCALE, _IMAGES_SCALE)
+                    # Pad a little so labels at the edges aren't clipped.
+                    pad = 6.0
+                    clip = fitz.Rect(
+                        max(page.rect.x0, cl.x0 - pad),
+                        max(page.rect.y0, cl.y0 - pad),
+                        min(page.rect.x1, cl.x1 + pad),
+                        min(page.rect.y1, cl.y1 + pad),
+                    )
+                    try:
+                        pix = page.get_pixmap(matrix=mat, clip=clip)
+                        pix.save(str(fig_path))
+                        found.append({
+                            "type": "figure",
+                            "image_path": str(fig_path),
+                            "bbox": (clip.x0, clip.y0, clip.x1, clip.y1),
+                            "page_number": pno + 1,
+                            "source": "pymupdf_vector",
+                        })
+                        idx += 1
+                        logger.info(
+                            "PyMuPDF vector cluster on page %d: "
+                            "%.0fx%.0f pt (%.1f%% of page)",
+                            pno + 1, clip.width, clip.height,
+                            100.0 * area / page_area,
+                        )
+                    except Exception as exc:
+                        logger.debug("vector cluster render failed: %s", exc)
+    except Exception as exc:
+        logger.warning("PyMuPDF page scan failed: %s", exc)
+    return found
+
+
+def parse_pdf(path: str | Path) -> list[dict[str, Any]]:
+    path = Path(path)
+    fig_dir = path.parent / "figures"
+
+    logger.info("Parsing %s with Docling (images_scale=%s)", path.name, _IMAGES_SCALE)
     converter = _build_converter()
     result = converter.convert(str(path))
     doc = result.document
 
+    # Diagnostic: count labels of everything iterate_items yields.
+    label_counts: Counter[str] = Counter()
+    picture_count_raw = 0
     elements: list[dict[str, Any]] = []
     figure_idx = 0
 
     for raw_item in doc.iterate_items():
         item = _unpack(raw_item)
         label = _get_label(item)
+        label_counts[label] += 1
+
+        is_pic = _is_picture(item)
+        if is_pic:
+            picture_count_raw += 1
+
+        if _DEBUG_DUMP:
+            logger.info(
+                "  item label=%s picture=%s page=%s bbox=%s text=%r",
+                label, is_pic,
+                _get_page_number(item),
+                _get_bbox(item),
+                (_get_text(item) or "")[:60],
+            )
 
         # ── Figure / Picture items ────────────────────────────────────
-        # Gate on _is_picture: get_image(doc) returns a page-crop for
-        # ANY item type in Docling 2.x, so without this check every text
-        # block becomes a figure.
-        if _is_picture(item):
-            img = _get_image(item, doc)
+        if is_pic:
+            page_no = _get_page_number(item)
+            bbox = _get_bbox(item)
+            fig_path = fig_dir / f"figure_{figure_idx}.png"
+
+            # Try Docling's native image first.
+            img = _docling_get_image(item, doc)
+            saved = False
             if img is not None:
-                fig_dir = Path(path).parent / "figures"
-                fig_dir.mkdir(parents=True, exist_ok=True)
-                fig_path = fig_dir / f"figure_{figure_idx}.png"
                 try:
+                    fig_dir.mkdir(parents=True, exist_ok=True)
                     img.save(str(fig_path))
-                    elements.append(
-                        {
-                            "type": "figure",
-                            "image_path": str(fig_path),
-                            "bbox": _get_bbox(item),
-                            "page_number": _get_page_number(item),
-                        }
-                    )
-                    figure_idx += 1
-                    continue
+                    saved = True
+                    logger.info("Figure %d: Docling image saved (page %d)",
+                                figure_idx, page_no)
                 except Exception as exc:
-                    logger.warning("Failed to save figure %d: %s", figure_idx, exc)
+                    logger.warning("Docling image save failed: %s", exc)
+
+            # Fallback: render the page region via PyMuPDF using bbox.
+            if not saved:
+                if _pymupdf_crop(path, page_no, bbox, fig_path):
+                    saved = True
+                    logger.info("Figure %d: PyMuPDF crop saved (page %d bbox=%s)",
+                                figure_idx, page_no, bbox)
+
+            if saved:
+                elements.append(
+                    {
+                        "type": "figure",
+                        "image_path": str(fig_path),
+                        "bbox": bbox,
+                        "page_number": page_no,
+                    }
+                )
+                figure_idx += 1
+                continue
             else:
                 logger.warning(
-                    "PictureItem on page %d has no extractable image — "
-                    "generate_picture_images may not be effective",
-                    _get_page_number(item),
+                    "PictureItem on page %d could not be saved by any method",
+                    page_no,
                 )
 
         # ── Text items ──
@@ -219,7 +483,7 @@ def parse_pdf(path: str | Path) -> list[dict[str, Any]]:
             )
             continue
 
-        # ── Table items (Docling 2.x: item.data = TableData) ──
+        # ── Table items ──
         df = _get_dataframe(item)
         if df is not None:
             elements.append(
@@ -234,9 +498,41 @@ def parse_pdf(path: str | Path) -> list[dict[str, Any]]:
             continue
 
     logger.info(
-        "Parsed %s: %d elements (%d figures)",
-        Path(path).name,
-        len(elements),
-        figure_idx,
+        "Docling labels seen: %s",
+        ", ".join(f"{k}={v}" for k, v in label_counts.most_common()),
+    )
+    logger.info(
+        "Docling produced %d raw PictureItems, %d saved as figures.",
+        picture_count_raw, figure_idx,
+    )
+
+    # ── PyMuPDF fallback: catches diagrams Docling missed entirely.
+    # Runs even when Docling found some figures — Docling often catches
+    # the Infineon logo but misses the actual technical diagram. We
+    # dedupe by spatial overlap so we don't double-count.
+    logger.info("Running PyMuPDF fallback to catch missed figures")
+    existing_regions: list[tuple[int, tuple]] = [
+        (e["page_number"], e["bbox"])
+        for e in elements
+        if e.get("type") == "figure" and e.get("bbox") is not None
+    ]
+    extras = _pymupdf_page_image_fallback(path, fig_dir, starting_idx=figure_idx)
+    kept = 0
+    for extra in extras:
+        if _overlaps_existing(extra, existing_regions):
+            logger.info("  skip extra on page %d — overlaps existing figure",
+                        extra["page_number"])
+            continue
+        elements.append(extra)
+        figure_idx += 1
+        kept += 1
+    if kept:
+        logger.info("PyMuPDF fallback added %d figure(s)", kept)
+    elif not extras:
+        logger.info("PyMuPDF found nothing additional.")
+
+    logger.info(
+        "Parsed %s: %d elements, %d figures total",
+        path.name, len(elements), figure_idx,
     )
     return elements
